@@ -1,0 +1,42 @@
+# VCS/Verdi 仿真产物
+simv_*
+csrc/
+*.daidir/
+*.vdb/
+*.log
+DVEfiles/
+verdiLog/
+novas.*
+ucli.key
+*.fsdb
+vc_hdrs.h
+.simv*
+
+# Vivado FPGA 实现产物（本仓库不含 soc/fpga/ 源内容，均由 scripts/run_soc_bitgen*.tcl 本地生成）
+/soc/fpga/
+/soc/doc/
+*.jou
+*.str
+.Xil/
+
+# LLaMA2 runc 系列应用的软件构建产物（obj*、由 tools/ 生成的权重头文件）
+/soc/sdk/software/apps/runc/obj*/
+/soc/sdk/software/apps/runc/stories_data.h
+/soc/sdk/software/apps/runc/tok512.h
+/soc/sdk/software/apps/runc_board/obj*/
+/soc/sdk/software/apps/runc_board/stories_data.h
+/soc/sdk/software/apps/runc_board/tok512.h
+/soc/sdk/software/apps/runc_hwsw_comp/obj*/
+/soc/sdk/software/apps/runc_hwsw_comp/stories_data.h
+/soc/sdk/software/apps/runc_hwsw_comp/tok512.h
+/soc/sdk/software/apps/runc_hwsw_comp/*.mif
+/soc/sdk/software/apps/runc_hwsw_comp/*.bin
+/soc/sdk/software/apps/memtest/obj*/
+/soc/sdk/software/apps/fputest/obj*/
+
+# 交叉编译工具链（本仓库不随包分发，见 scripts/build_picolibc_hwfp.sh / build_gcc_ilp32f_multilib.sh 自行构建）
+/soc/sdk/toolchains/
+
+/reports/*
+/.vscode/*
+**/__pycache__/

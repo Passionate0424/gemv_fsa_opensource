@@ -1,0 +1,243 @@
+TOP ?= tb_pe_dualflow
+SIMV ?= simv_$(TOP)
+VCS_LOG ?= vcs_$(TOP).log
+RUN_LOG ?= run_$(TOP).log
+RUN_ARGS ?=
+
+# -assert svaext：pulp-platform 的 common_cells/axi 用了 deferred assertion
+#   （`assert final`，见 addr_decode_dync.sv / onehot_to_bin.sv / axi_id_prepend.sv），
+#   不加这个选项 VCS 直接报语法错。这是解析层的语言扩展开关，对不含断言的既有代码是空操作。
+ifdef LIGHT_COMPILE
+VCS_FLAGS := -full64 -sverilog -timescale=1ns/1ps +v2k -assert svaext
+else
+VCS_FLAGS := -full64 -sverilog -timescale=1ns/1ps +v2k -assert svaext \
+	-debug_access+all -kdb -lca +lint=TFIPC-L
+endif
+
+COMMON_INC := +incdir+./rtl/PE +incdir+./tb
+CFLAGS := -CFLAGS "-std=c99"
+FILELIST ?= ./scripts/pe_dualflow_filelist.f
+
+# Force full compilation
+VCS_FLAGS += -Mupdate=0
+
+# FSDB dump (Verdi PLI) — 自动检测novas.tab路径
+# 注意：ifeq ($(FSDB),1) 而非 ifdef FSDB
+#   Make的ifdef在FSDB=0时也为真（只要定义了就算），导致服务器无PLI文件时报错
+FSDB_TAB := $(shell ls /opt/Synopsys/verdi/*/share/PLI/VCS/LINUX64/novas.tab 2>/dev/null | head -1)
+FSDB_PLI := $(shell ls /opt/Synopsys/verdi/*/share/PLI/VCS/LINUX64/pli.a 2>/dev/null | head -1)
+ifeq ($(FSDB),1)
+ifneq ($(FSDB_TAB),)
+VCS_FLAGS += -P $(FSDB_TAB) $(FSDB_PLI)
+endif
+endif
+
+# Optional extra define (e.g. EXTRA_DEFINE=ASIC_TARGET=1)
+ifdef EXTRA_DEFINE
+VCS_FLAGS += +define+$(EXTRA_DEFINE)
+endif
+
+# 未初始化寄存器的初值策略。默认不给（VCS 用 X），INITREG=random 则每个未复位的
+# 寄存器在 0 时刻取随机值，配合 SEED= 换种子。
+#
+# 为什么需要它：板上 FPGA 的触发器上电取 bitstream 里的 INIT（通常 0），仿真默认给
+# X 或 0 —— **两边都恰好是确定值**，所以"设计依赖了没被复位的状态"这一整类缺陷
+# 在两边都不暴露。今天找到的五个 bug（SRL 无复位端、IOB 缺复位、两处 latch、
+# fsa_k_chunk_sel 漏在复位表外）全属于这一类，全都是靠网表扫描才发现的。
+# 随机化初值能让仿真自己把它们逼出来：换种子结果变 = 存在这类依赖。
+ifdef INITREG
+VCS_FLAGS += +vcs+initreg+$(INITREG)
+endif
+ifdef SEED
+VCS_FLAGS += +ntb_random_seed=$(SEED)
+endif
+
+.PHONY: compile run run_fsa_all run_fsa_bitacc run_fsa_pf run_gemv_all run_gemv_pf run_fsa_1x32_hd64 run_fsa_1x32_hd48
+
+compile:
+	@# 强制删除增量编译产物，确保DPI C文件（如e2e_golden.c）每次重编。
+	@# VCS的-Mupdate=0只对RTL有效，对DPI C的.o看时间戳跳过，导致改了.c却用旧stub。
+	rm -rf csrc $(SIMV).daidir $(SIMV)
+	vcs $(VCS_FLAGS) $(CFLAGS) $(COMMON_INC) -f $(FILELIST) -top $(TOP) -o $(SIMV) -l $(VCS_LOG)
+
+run: compile
+	set -o pipefail; ./$(SIMV) $(RUN_ARGS) 2>&1 | tee $(RUN_LOG)
+
+# FSA E2E全量回归：4×8 + 2×16 + 1×32
+# 注意：TB日志中PASS/FAIL必须使用标准格式 [E2E] PASS / [E2E] [FAIL]
+# 避免与精度报告中的 "Failed (rel>15%): 0" 等统计行混淆
+run_fsa_all: compile
+	@echo "========== FSA E2E Regression: 4x8 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=8 +NUM_HEADS=4 +GROUP_MODE=0 2>&1 | tee run_fsa_4x8.log
+	@echo "========== FSA E2E Regression: 2x16 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=16 +NUM_HEADS=2 +GROUP_MODE=1 2>&1 | tee run_fsa_2x16.log
+	@echo "========== FSA E2E Regression: 1x32 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=32 +NUM_HEADS=1 +GROUP_MODE=2 2>&1 | tee run_fsa_1x32.log
+	@echo "========== Summary =========="
+	@echo "4x8:"; grep -c '\[E2E\] PASS' run_fsa_4x8.log; grep '\[E2E\] \[FAIL\]' run_fsa_4x8.log || echo "  ALL PASS"
+	@echo "2x16:"; grep -c '\[E2E\] PASS' run_fsa_2x16.log; grep '\[E2E\] \[FAIL\]' run_fsa_2x16.log || echo "  ALL PASS"
+	@echo "1x32:"; grep -c '\[E2E\] PASS' run_fsa_1x32.log; grep '\[E2E\] \[FAIL\]' run_fsa_1x32.log || echo "  ALL PASS"
+
+# FSA E2E 位级golden回归：分组模式与run_fsa_all相同，但对照bit-accurate golden。
+# run_fsa_all用的是fp64理想golden，那边有13个已知的PWL精度边界失败
+# （seq250/253/254_32tile、seq511_64tile、seq512_fulltile、seq1023_128tile、
+#  sweep_48t/56t/64t_r2、seq320_full，见constrain.md判定标准(a)）。
+# 位级golden逐条转录RTL，上述13个在这里必须全部通过——这正是区分
+# "对照物差异"和"真实功能bug"的判据，改动FSA通路后一定要跑这个确认。
+run_fsa_bitacc: compile
+	@echo "========== FSA E2E BitAcc: 4x8 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=8 +NUM_HEADS=4 +GROUP_MODE=0 +GOLDEN_BITACC 2>&1 \
+	  | tee run_fsa_4x8_bitacc.log
+	@echo "========== FSA E2E BitAcc: 2x16 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=16 +NUM_HEADS=2 +GROUP_MODE=1 +GOLDEN_BITACC 2>&1 \
+	  | tee run_fsa_2x16_bitacc.log
+	@echo "========== FSA E2E BitAcc: 1x32 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=32 +NUM_HEADS=1 +GROUP_MODE=2 +GOLDEN_BITACC 2>&1 \
+	  | tee run_fsa_1x32_bitacc.log
+	@echo "========== BitAcc Summary (FAIL must be 0) =========="
+	@for f in run_fsa_4x8_bitacc.log run_fsa_2x16_bitacc.log run_fsa_1x32_bitacc.log; do \
+	  printf "%-28s PASS=%-4s FAIL=%s\n" $$f \
+	    "$$(grep -c '\[E2E\] PASS' $$f)" "$$(grep -c '\[E2E\] \[FAIL\]' $$f)"; \
+	done
+
+# FSA的K tile 0预取回归：三种分组模式 × 三条预取通路。
+# 判据与run_fsa_all完全一致——仍与golden逐位对照。预取只该改变K什么时候到达SRAM，
+# 不该改变算出什么；命中要算对，失效回退也要算对。
+#   PF_MODE=1 正常命中（S_FSA_WAIT_K的tile 0不再发DMA）
+#   PF_MODE=2 失效：预取后重写REG_K_BASE
+#   PF_MODE=3 target不符：以GEMV权重为target预取，FSA任务不得命中
+# 一律对照 bit-accurate golden：默认的fp64 golden有13个已知PWL精度边界失败，
+# 混进来会让"预取是否引入错误"这个判据变浑。位级golden下判据干净——必须零FAIL。
+run_fsa_pf: compile
+	@for m in 1 2 3; do \
+	  echo "========== FSA E2E Prefetch: 4x8 PF_MODE=$$m =========="; \
+	  ./$(SIMV) +HEAD_DIM=8 +NUM_HEADS=4 +GROUP_MODE=0 +GOLDEN_BITACC +PF_MODE=$$m 2>&1 \
+	    | tee run_fsapf_4x8_m$$m.log; \
+	  echo "========== FSA E2E Prefetch: 1x32 PF_MODE=$$m =========="; \
+	  ./$(SIMV) +HEAD_DIM=32 +NUM_HEADS=1 +GROUP_MODE=2 +GOLDEN_BITACC +PF_MODE=$$m 2>&1 \
+	    | tee run_fsapf_1x32_m$$m.log; \
+	done
+	@echo "========== FSA Prefetch Summary =========="
+	@for f in run_fsapf_*.log; do \
+	  printf "%-28s PASS=%-4s " $$f "$$(grep -c '\[E2E\] PASS' $$f)"; \
+	  grep -c '\[E2E\] \[FAIL\]' $$f | xargs printf "FAIL=%s\n"; \
+	done
+
+# head_dim>32定向验证（阶段2.10补充，不计入139 case基线，独立目标）
+# hd64: chunk2_width=32，不需要DMA padding；hd48: chunk2_width=16，需要padding路径
+run_fsa_1x32_hd64: compile
+	@echo "========== FSA E2E Directed: 1x32 head_dim=64 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=64 +NUM_HEADS=1 +GROUP_MODE=2 2>&1 | tee run_fsa_1x32_hd64.log
+	@grep -c '\[E2E\] PASS' run_fsa_1x32_hd64.log; grep '\[E2E\] \[FAIL\]' run_fsa_1x32_hd64.log || echo "  ALL PASS"
+
+run_fsa_1x32_hd48: compile
+	@echo "========== FSA E2E Directed: 1x32 head_dim=48 =========="
+	set -o pipefail; ./$(SIMV) +HEAD_DIM=48 +NUM_HEADS=1 +GROUP_MODE=2 2>&1 | tee run_fsa_1x32_hd48.log
+	@grep -c '\[E2E\] PASS' run_fsa_1x32_hd48.log; grep '\[E2E\] \[FAIL\]' run_fsa_1x32_hd48.log || echo "  ALL PASS"
+
+# GEMV OS模式全量回归：14 cases
+# 注意：TB日志中PASS/FAIL必须使用标准格式 [PASS] / [FAIL]
+GEMV_CASES := TC_Sanity_Check TC_Identity_Matrix TC_Small_8x8 TC_Zero_Matrix \
+	TC_Boundary_NoTiling TC_OS_Row_Shift64 TC_OS_Drain_LastColumn \
+	TC_OS_TwoTile_128 TC_OS_SingleTile_64x64 TC_OS_RowTile_64x128 \
+	TC_OS_RowTile_33x64 TC_OS_RowTile_33x128 TC_OS_RowCol_33x172 \
+	TC_OS_RowCol_64x172
+
+run_gemv_all: compile
+	@pass=0; fail=0; \
+	for c in $(GEMV_CASES); do \
+		echo "--- Running $$c ---"; \
+		./$(SIMV) +CASE=$$c 2>&1 | tee run_gemv_$$c.log; \
+		if grep -q '\[PASS\]' run_gemv_$$c.log; then \
+			pass=$$((pass+1)); \
+		else \
+			fail=$$((fail+1)); echo "[REGRESSION FAIL] $$c"; \
+		fi; \
+	done; \
+	echo "========== GEMV Summary: PASS=$$pass FAIL=$$fail =========="
+
+# GEMV权重预取回归：每个case在4条预取通路上各重跑一遍。
+# 判据不是"跑通"而是**结果与PF_MODE=0的基线逐位相同**——命中要算对，失效回退
+# 也要算对。TB内部还会检查PF_VALID确实置起过，防止预取压根没发生的假通过。
+#   PF_MODE=1 正常命中（跳过首块DMA）
+#   PF_MODE=2 失效规则1：预取后重写REG_ROWS
+#   PF_MODE=3 失效规则1：预取后重写REG_MI_BASE
+#   PF_MODE=4 失效规则3：以FSA为target预取，GEMV任务不得命中
+run_gemv_pf: compile
+	@pass=0; fail=0; \
+	for m in 1 2 3 4; do \
+	  for c in $(GEMV_CASES); do \
+		echo "--- Running $$c PF_MODE=$$m ---"; \
+		./$(SIMV) +CASE=$$c +PF_MODE=$$m 2>&1 | tee run_gemvpf_$${c}_m$$m.log; \
+		if grep -q '\[PASS\]' run_gemvpf_$${c}_m$$m.log; then \
+			pass=$$((pass+1)); \
+		else \
+			fail=$$((fail+1)); echo "[REGRESSION FAIL] $$c PF_MODE=$$m"; \
+		fi; \
+	  done; \
+	done; \
+	echo "========== GEMV Prefetch Summary: PASS=$$pass FAIL=$$fail =========="
+
+# ============================================================
+# UVM验证环境
+# ============================================================
+UVM_TOP ?= tb_top
+UVM_TEST ?= cb_top_base_test
+UVM_VERBOSITY ?= UVM_MEDIUM
+UVM_FILELIST ?= ./uvm/top/uvm_filelist.f
+UVM_SIMV ?= simv_uvm
+UVM_VCS_LOG ?= vcs_uvm.log
+UVM_RUN_LOG ?= run_uvm_$(UVM_TEST).log
+
+UVM_VCS_FLAGS := $(VCS_FLAGS) -ntb_opts uvm-1.2 +define+UVM_NO_DEPRECATED \
+	+incdir+./uvm/agents/axi_slv +incdir+./uvm/agents/mem_model \
+	+incdir+./uvm/env +incdir+./uvm/sequences +incdir+./uvm/tests \
+	+incdir+./uvm/interfaces +incdir+./uvm/dpi +incdir+./uvm/top
+
+.PHONY: compile_uvm run_uvm run_uvm_gemv_sanity run_uvm_fsa_sanity
+
+compile_uvm:
+	vcs $(UVM_VCS_FLAGS) $(CFLAGS) $(COMMON_INC) -f $(UVM_FILELIST) -top $(UVM_TOP) -o $(UVM_SIMV) -l $(UVM_VCS_LOG)
+
+run_uvm: compile_uvm
+	set -o pipefail; ./$(UVM_SIMV) +UVM_TESTNAME=$(UVM_TEST) +UVM_VERBOSITY=$(UVM_VERBOSITY) 2>&1 | tee $(UVM_RUN_LOG)
+
+run_uvm_gemv_sanity: compile_uvm
+	set -o pipefail; ./$(UVM_SIMV) +UVM_TESTNAME=gemv_sanity_test +UVM_VERBOSITY=UVM_MEDIUM 2>&1 | tee run_uvm_gemv_sanity.log
+
+run_uvm_fsa_sanity: compile_uvm
+	set -o pipefail; ./$(UVM_SIMV) +UVM_TESTNAME=fsa_sanity_test +UVM_VERBOSITY=UVM_MEDIUM 2>&1 | tee run_uvm_fsa_sanity.log
+
+# 带代码覆盖率的UVM编译/运行
+UVM_COV_SIMV ?= simv_uvm_cov
+UVM_COV_FLAGS := -cm line+branch+cond+tgl+fsm -cm_hier ./uvm/coverage/cov_hier.cfg
+
+compile_uvm_cov:
+	vcs $(UVM_VCS_FLAGS) $(UVM_COV_FLAGS) $(CFLAGS) $(COMMON_INC) -f $(UVM_FILELIST) -top $(UVM_TOP) -o $(UVM_COV_SIMV) -l vcs_uvm_cov.log
+
+run_uvm_cov: compile_uvm_cov
+	set -o pipefail; ./$(UVM_COV_SIMV) +UVM_TESTNAME=$(UVM_TEST) +UVM_VERBOSITY=$(UVM_VERBOSITY) -cm line+branch+cond+tgl+fsm -cm_name $(UVM_TEST) 2>&1 | tee run_uvm_cov_$(UVM_TEST).log
+	urg -dir $(UVM_COV_SIMV).vdb -report cov_report -format text 2>&1 | tee urg_$(UVM_TEST).log
+
+# 完整覆盖率回归：合并所有test的覆盖率
+run_uvm_cov_full: compile_uvm_cov
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=gemv_regression_test -cm line+branch+cond+tgl+fsm -cm_name gemv_reg +timeout_cycles=2000000 2>&1 | tee run_cov_gemv_reg.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_regression_test -cm line+branch+cond+tgl+fsm -cm_name fsa_reg +timeout_cycles=20000000 2>&1 | tee run_cov_fsa_reg.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=dual_mode_stress_test -cm line+branch+cond+tgl+fsm -cm_name stress +timeout_cycles=5000000 2>&1 | tee run_cov_stress.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=csr_access_test -cm line+branch+cond+tgl+fsm -cm_name csr +timeout_cycles=2000000 2>&1 | tee run_cov_csr.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=gemv_random_test -cm line+branch+cond+tgl+fsm -cm_name gemv_rand +timeout_cycles=20000000 +num_iterations=30 2>&1 | tee run_cov_gemv_rand.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=gemv_random_bigrow_test -cm line+branch+cond+tgl+fsm -cm_name gemv_rand_bigrow +timeout_cycles=20000000 2>&1 | tee run_cov_gemv_rand_bigrow.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_random_test -cm line+branch+cond+tgl+fsm -cm_name fsa_rand +timeout_cycles=50000000 +num_iterations=30 2>&1 | tee run_cov_fsa_rand.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=error_injection_test -cm line+branch+cond+tgl+fsm -cm_name err_inj +timeout_cycles=5000000 2>&1 | tee run_cov_err_inj.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=mid_op_reset_test -cm line+branch+cond+tgl+fsm -cm_name mid_reset +timeout_cycles=10000000 2>&1 | tee run_cov_mid_reset.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=precise_fsm_reset_test -cm line+branch+cond+tgl+fsm -cm_name precise_reset +timeout_cycles=20000000 2>&1 | tee run_cov_precise_reset.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=special_fp_test -cm line+branch+cond+tgl+fsm -cm_name special_fp +timeout_cycles=5000000 2>&1 | tee run_cov_special_fp.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_residue_impact_test -cm line+branch+cond+tgl+fsm -cm_name residue +timeout_cycles=20000000 2>&1 | tee run_cov_residue.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_soak_test -cm line+branch+cond+tgl+fsm -cm_name soak +timeout_cycles=50000000 +soak_rounds=30 2>&1 | tee run_cov_soak.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_hd64_test -cm line+branch+cond+tgl+fsm -cm_name hd64 +timeout_cycles=20000000 2>&1 | tee run_cov_hd64.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=fsa_hd48_test -cm line+branch+cond+tgl+fsm -cm_name hd48 +timeout_cycles=20000000 2>&1 | tee run_cov_hd48.log
+	./$(UVM_COV_SIMV) +UVM_TESTNAME=perf_limit_test -cm line+branch+cond+tgl+fsm -cm_name perf_limit +timeout_cycles=50000000 2>&1 | tee run_cov_perf_limit.log
+	urg -dir $(UVM_COV_SIMV).vdb -report cov_report -format text 2>&1 | tee urg_full.log
+
+cov_report:
+	urg -dir $(UVM_COV_SIMV).vdb -report cov_report -format both

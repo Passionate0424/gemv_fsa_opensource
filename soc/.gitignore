@@ -1,0 +1,8 @@
+rtl/ip/PLL_2019_2/clk_pll_sim_netlist.v
+rtl/ip/PLL_2019_2/clk_pll_sim_netlist.vhdl
+rtl/ip/PLL_2019_2/clk_pll_stub.v
+rtl/ip/PLL_2019_2/clk_pll_stub.vhdl
+rtl/ip/PLL_2019_2/clk_pll.dcp
+
+fpga/project/Loongson_Soc.cache/wt/*
+fpga/project/Loongson_Soc.sim/*

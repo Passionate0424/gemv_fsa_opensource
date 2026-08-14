@@ -1,0 +1,28 @@
+[binaries]
+# Meson 0.53.2 doesn't use any cflags when doing basic compiler tests,
+# so we have to add -nostdlib to the compiler configuration itself or
+# early compiler tests will fail. This can be removed when picolibc
+# requires at least version 0.54.2 of meson.
+#
+# 基于 la32r-picolibc 仓库自带的 scripts/cross-loongarch32r-linux-gnusf.txt
+# (软浮点版)，唯一区别是 [properties] 里加了 c_args 切到硬浮点 ABI
+# (-mabi=ilp32f -msingle-float)。工具链二进制用裸名，靠
+# build_picolibc_hwfp.sh 在调用 meson 前把工具链 bin 目录加进 PATH。
+c = ['loongarch32r-linux-gnusf-gcc', '-nostdlib']
+ar = 'loongarch32r-linux-gnusf-ar'
+as = 'loongarch32r-linux-gnusf-as'
+ld = 'loongarch32r-linux-gnusf-ld'
+nm = 'loongarch32r-linux-gnusf-nm'
+strip = 'loongarch32r-linux-gnusf-strip'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'loongarch32r'
+cpu = 'loongarch32r'
+endian = 'little'
+
+[properties]
+skip_sanity_check = true
+link_spec = '--build-id=none'
+specs_extra = ['*libgcc:', '-lgcc']
+c_args = ['-mabi=ilp32f', '-msingle-float']

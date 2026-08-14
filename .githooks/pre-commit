@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+# =============================================================================
+# Part 1: 自动同步加速器RTL到soc/rtl/ip/gemv_accel/
+# =============================================================================
+GEMV_ACCEL_DIR="soc/rtl/ip/gemv_accel"
+
+declare -A SYNC_MAP=(
+    ["rtl/CB_top_v2.sv"]=""
+    ["rtl/cb_controll_v2.sv"]=""
+    ["rtl/mac_top_v2.sv"]=""
+    ["rtl/PE_core_v2.sv"]=""
+    ["rtl/write_out_v2.sv"]=""
+    ["rtl/axi_dma_controller.sv"]=""
+    ["rtl/fpmul_seq_pipeline.sv"]=""
+    ["rtl/fpadd_seq.sv"]=""
+    ["rtl/sram_synth_wrapper.sv"]=""
+    ["rtl/PE/PE_retimed.sv"]="PE"
+    ["rtl/PE/FPMacUnit.sv"]="PE"
+    ["rtl/PE/RawFloat_MulAddExp2.sv"]="PE"
+    ["rtl/PE/RawFloat_FMA_LA.sv"]="PE"
+    ["rtl/PE/RawFloat_SplitIF.sv"]="PE"
+    ["rtl/PE/fpadd_seq_2stage.sv"]="PE"
+    ["rtl/PE/fp_pre_add.sv"]="PE"
+    ["rtl/fsa/fsa_ctrl_fsm.sv"]="fsa"
+    ["rtl/fsa/fsa_transposer.sv"]="fsa"
+    ["rtl/fsa/fsa_trans_merge.sv"]="fsa"
+    ["rtl/fsa/fsa_accumulator.sv"]="fsa"
+    ["rtl/fsa/fsa_acc_sram.sv"]="fsa"
+    ["rtl/fsa/FPAccUnit_pipe.sv"]="fsa"
+    ["rtl/fsa/RawFloat_Div.sv"]="fsa"
+    ["rtl/fsa_gen/chisel_fsa_fp32/CMP.sv"]="fsa_gen/chisel_fsa_fp32"
+    ["rtl/fsa_gen/chisel_fsa_fp32/FPCmpUnit.sv"]="fsa_gen/chisel_fsa_fp32"
+    ["rtl/fsa_gen/chisel_fsa_fp32/fp32_comparator.sv"]="fsa_gen/chisel_fsa_fp32"
+)
+
+synced=0
+
+# AXI桥同步到soc Bus_interconnects
+BRIDGE_SRC="rtl/axi2sram_sp_ext.sv"
+BRIDGE_DST="soc/rtl/ip/Bus_interconnects/axi2sram_sp_ext.sv"
+if git diff --cached --name-only | grep -qx "$BRIDGE_SRC"; then
+    cp "$BRIDGE_SRC" "$BRIDGE_DST"
+    git add "$BRIDGE_DST"
+    synced=$((synced + 1))
+fi
+for src in "${!SYNC_MAP[@]}"; do
+    if git diff --cached --name-only | grep -qx "$src"; then
+        subdir="${SYNC_MAP[$src]}"
+        if [ -n "$subdir" ]; then
+            dst="$GEMV_ACCEL_DIR/$subdir/$(basename $src)"
+        else
+            dst="$GEMV_ACCEL_DIR/$(basename $src)"
+        fi
+        cp "$src" "$dst"
+        git add "$dst"
+        synced=$((synced + 1))
+    fi
+done
+
+if [ $synced -gt 0 ]; then
+    echo "[hook] 已同步 $synced 个文件到 $GEMV_ACCEL_DIR/"
+fi
+
+exit 0

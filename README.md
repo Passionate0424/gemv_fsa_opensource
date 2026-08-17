@@ -1,7 +1,8 @@
 # GEMV-FSA：支持 FlashAttention 的推理加速 SoC
 
 面向边缘端 LLM 推理的双模式脉动阵列加速器：同一套 32-PE 阵列，用输出驻留（OS）数据流加速
-线性层 GEMV，用权重驻留（WS）+ FlashAttention-2 在线 softmax 加速注意力。
+线性层 GEMV，用权重驻留（WS）+ FlashAttention-2 在线 softmax 加速注意力。配合 CPU 侧浮点
+扩展与 64 位总线，在无硬件浮点的国产标量处理器上跑通 llama2.c 端到端推理。
 
 本仓库是 **2026 年全国大学生集成电路创新创业大赛（集创赛）龙芯中科杯总决赛**参赛作品
 《支持 FlashAttention 的推理加速 SoC 设计》的前端设计部分开源发布。
@@ -14,174 +15,79 @@
 | 队伍编号 | **CICC1001054** |
 | 作品名称 | 支持 FlashAttention 的推理加速 SoC 设计 |
 
-## 项目背景
+![系统总览](docs/figures/system_overview.png)
 
-本设计面向 LLaMA2 这类 decoder-only Transformer 的**自回归解码阶段**——每步只生成一个 token。
-该阶段每一层内部依次要算两类算子，二者都是**访存密集（memory-bound）**、算术强度很低，
-瓶颈在数据搬运而非算力。
+> **图 1** 系统总览：上半为目标模型 LLaMA 的单层结构，下半为完整 SoC——OpenLA500 处理核
+> （含新增 FPU）与脉动阵列加速单元经 AXI Crossbar 与各外设互联。
 
-**线性层**（Q/K/V/O 投影、FFN 的 W1/W2/W3，以及最后的 classifier）：每步只有单个 token
-向量，矩阵乘退化为**矩阵-向量乘（GEMV）**——权重矩阵远大于输入向量，每个权重只参与一次
-乘加就被丢弃，频繁的权重装载成为主要瓶颈。又因每层权重各不相同、算完即弃，权重驻留毫无
-意义，故映射为**输出驻留（OS）**数据流：部分和在 PE 内原位累加，权重与输入向量流过阵列，
-正好契合"输入向量小、权重体量大、层间切换频繁"的访存特征。
+## 核心成果
 
-![GEMV 的 Output-Stationary 脉动数据流](docs/figures/gemv_os_dataflow.png)
+在 llama2.c / stories260K、256-token 序列上实测（完整 SoC 端到端口径，覆盖 GEMV、FSA 与 CPU 调度）：
 
-> **图 1** GEMV 的 OS 脉动数据流：部分和驻留在 PE 内原位累加，输入数据沿阵列流动并被各级 PE 复用。
+| 指标 | 结果 |
+|---|---|
+| **端到端推理** | **210×** 加速（107,535,372 → 511,431 cycles/token） |
+| **精度** | greedy 解码与纯 CPU **逐 token 一致**；端到端 FlashAttention MRE 0.0985% |
+| **功能验证** | UVM 约 590 个测试点全 PASS；功能覆盖率 95.19%、Line 91.08% |
+| **可综合可上板** | DC（Nangate45）200 MHz 时序收敛；FPGA `xc7a200t` 已上板跑通，整机 LUT 110,770（82.30%） |
 
-**注意力**（当前 token 的 Q 与 KV cache 中的历史 K/V 做 $QK^\top$ → softmax → $PV$）：
-每步同样只有一行 Q，却要把整个 KV cache 读一遍才做很少的乘加；且 softmax 的逐行全局归约
-使中间结果的访存量随序列长度呈 $O(N^2)$ 增长，极易超过片上存储。这一路的设计分两步走。
-**先在算法层**引入 **FlashAttention-2 的在线 softmax**：沿序列维把 K/V 分块，逐块更新行
-最大值 $m$ 与归一化分母 $l$、并对已累加的输出 $O$ 做 rescale，全程不显式存储完整的注意力
-矩阵，把访存复杂度降至 $O(N)$。**再由该算法的流式特性推导硬件数据流**：分数随计算逐行
-流出、随即做最大值比较与指数变换，无需等整个矩阵就绪，但这要求一条"流出—变换—流回"的
-通路——OS 把部分和封锁在 PE 内、末端才一次性 drain，中途取不到中间结果，只有 **权重驻留
-（WS）** 天然支持。故注意力取 WS：Q 驻留在 PE 寄存器，K/V 沿阵列流入，$QK^\top$ 的累加、
-softmax 的传播与 rescale、$PV$ 的累加在同一条脉动链上流水完成。
+210× 由两级叠加而来：**双模式加速器本身 27.6×**（107.5M → 3.90M cycles/token），
+再叠加 **CPU 侧 FPU 等优化 7.6×**（3.90M → 0.51M）。
+
+## 设计要点
+
+### 1. 一套阵列覆盖两类算子
+
+自回归解码阶段每层内有两类算子，都是访存密集：线性层因每步只有单个 token 向量而退化为 **GEMV**，
+注意力则要读完整 KV cache 且 softmax 归约使访存随序列长度呈 $O(N^2)$ 增长。二者数据复用方式相反，
+故分别选型：GEMV 权重算完即弃 → **输出驻留（OS）**；注意力先在算法层引入
+**FlashAttention-2 在线 softmax** 把访存降至 $O(N)$，再由其流式特性推出需要"流出—变换—流回"通路
+→ **权重驻留（WS）**。两者共用同一套 32-PE 阵列，省去为两类算子各做一套的开销。
 
 ![FSA 在脉动链上的四阶段数据流](docs/figures/fsa_dataflow.png)
 
 > **图 2** FSA 数据流的四个阶段：① K 流入、Q 驻留算 QKᵀ 上行累加 → ② CMP 求行最大值 M₀ →
 > ③ 减最大值后经 slope/intercept 查表做 exp2 分段线性近似得到 P → ④ P 与 V 相乘下行累加出 O。
 
-两类算子若各做一套阵列，在资源受限的边缘 FPGA 上并不划算，因此本设计让同一套 32-PE 阵列
-通过可重构分组与上述双模式数据流同时覆盖二者——32 可被 8/16/32 整除，因此能无浪费地重构为
-三种分组，覆盖 `head_dim` 从 8 到 64 的不同配置。
+### 2. 可重构分组适配不同头维度
+
+32 可被 8/16/32 整除，因此能无浪费地重构为 **4×8 / 2×16 / 1×32** 三种分组，覆盖 `head_dim`
+从 8 到 64 的配置。分组变大时由多段 PE 串联成更长的脉动链。
 
 ![32-PE 阵列的三种可重构分组](docs/figures/reconfig_grouping.png)
 
-> **图 3** 可重构分组：4×8（4 头并行，每头 8 PE）/ 2×16 / 1×32。分组变大时由多段 PE 串联成更长的
-> 脉动链，灰色 CMP 表示该段的比较单元在本模式下不使能。
+> **图 3** 可重构分组：4×8（4 头并行，每头 8 PE）/ 2×16 / 1×32，灰色 CMP 表示该段比较单元在本模式下不使能。
 
-但只做加速器还不够。竞赛平台龙芯 OpenLA500 是**单核标量、且无硬件浮点单元**的嵌入式处理器（LoongArch32，
-33 MHz）：乘加只能串行执行，非线性算子（RMSNorm、RoPE、SiLU）全靠软浮点模拟，单 token 解码
-需上亿周期（约 3.3 秒）——在这样的平台上，算力本身先成了约束。本项目从三个方向补齐短板：
+### 3. CPU 硬件浮点扩展
 
-1. **双模式脉动阵列加速 IP** —— 即上述 OS/WS 双模式阵列，可重构为 4×8 / 2×16 / 1×32
-   三种分组以适配不同的单头维度（`head_dim` 8~64）；
-2. **CPU 硬件浮点扩展** —— 为原本无 FPU 的 CPU 挂上 CVFPU 协处理器，消除非线性算子的
-   软浮点模拟开销；
-3. **SoC 总线加宽至 64 位** —— 算子卸载完成后瓶颈转移到数据搬运，把访存通路整体加宽
-   一倍（详见下文）。
+原 OpenLA500 是纯整数五级流水、无任何浮点部件，RMSNorm/RoPE/SiLU 全靠软浮点模拟。扩展方案：
+ID 级增加 FP 解码与浮点寄存器堆（3R2W / FCC）、EX 级挂 CVFPU 并异步解耦、WB 增开第二写口回写浮点。
+这一项贡献了整体加速中的 7.6×。
 
-三者经 AXI 互联组成完整的推理加速 SoC，在 FPGA 上跑通 llama2.c + stories260K 的端到端
-自回归推理。加速器顶层由 AXI 从接口与 CSR 寄存器组、AXI 主接口与 DMA 控制器、计算核心
-（32 个 PE、CMP 比较单元、累加器与片上 SRAM）以及顶层作业控制器四部分组成：
+![CPU 浮点流水线扩展](docs/figures/fpu_pipeline.png)
+
+> **图 4** FPU 扩展前后对比：(a) 原始 OpenLA500 纯整数五级流水；(b) +FPU 扩展，
+> 灰 = 不变、黄 = 改造、绿 = 新增。
+
+### 4. SoC 总线加宽至 64 位
+
+算子卸载到加速器后，瓶颈从算力转移到数据搬运（`GEMV.hw` 中约 87% 的时间是纯搬运）。开发板上两片
+各 32 位的异步 SRAM 原本由 `addr[22]` 二选一、同一拍总有一片闲置，改为并联出 64 位后单次访问字节数
+翻倍，而异步 SRAM 的访问时序不变。互连同步换成 pulp-platform 的参数化 `axi_xbar`，CPU 侧插一级
+`axi_dw_converter` 升宽。**cycles/token 再降 13.7%**，代价是 +3,639 LUT。
+
+![SoC 架构](docs/figures/soc_block.png)
+
+> **图 5** SoC 架构：OpenLA500（含 FPU）与加速单元经 AXI Crossbar 挂接 Confreg / DVI / UART /
+> SRAM 控制器等外设。
 
 ![加速器顶层架构](docs/figures/top_architecture.png)
 
-> **图 4** 加速器顶层架构：CSR/DMA 调度 + 32-PE 脉动阵列 + Input/Vector/ACC/Output 四级片上 SRAM。
-> CPU 通过 CSR 配置一次 job 并启动，顶层状态机驱动 DMA 搬数、触发阵列计算、再把结果写回内存，
-> 全程 CPU 不介入数据搬运。
+> **图 6** 加速器顶层：CSR/DMA 调度 + 32-PE 脉动阵列 + Input/Vector/ACC/Output 四级片上 SRAM。
+> CPU 通过 CSR 配置一次 job 并启动，顶层状态机驱动 DMA 搬数、触发计算、写回结果，全程不介入数据搬运。
 
-| 项目 | 内容 |
-|------|------|
-| 目标平台 | Xilinx Artix-7 `xc7a200tfbg676-1` |
-| 工作频率 | 加速器 `sys_clk` 50 MHz / CPU `cpu_clk` 33 MHz |
-| 核心架构 | 32-PE 一维脉动阵列，可重构为 4组×8 / 2组×16 / 1组×32 |
-| 数据格式 | IEEE 754 FP32 |
-| 接口 | AXI4 Slave（CSR，20 个寄存器） + AXI4 Master（DMA） |
-| 目标模型 | llama2.c / stories260K（5 层，dim=64，8 头，vocab=512，GQA） |
-| SoC 平台 | 龙芯 OpenLA500（LoongArch32）+ CVFPU + 本加速器，AXI 总线加宽至 64 位 |
-
-## 性能与精度
-
-端到端口径为完整 SoC 逐 token 推理耗时（覆盖 GEMV、FSA 与 CPU 调度全流程），
-在 stories260K、256-token 序列上实测：
-
-| 配置 | cycles/token | 相对纯软基线 |
-|------|-------------:|-------------|
-| 纯 CPU 软浮点基线 | 107,535,372 | 1× |
-| + 双模式加速器（含 DMA/流水/uncached/outstanding 等优化） | 3,899,347 | **27.6×** |
-| + CPU 侧 FPU、GQA、SiLU 融合、跨调用预取、64 位总线 | 511,431 | **210×** |
-
-精度方面：
-
-- **exp2 单算子**：8 段分段线性（PWL）近似，系数取 **Chebyshev 节点**拟合（RTL 内即为该组
-  系数，见 [FPAccUnit_pipe.sv](rtl/fsa/FPAccUnit_pipe.sv)），全量扫描 32000 个 fp32 负值输入
-  对照 fp64，MRE 0.0286%、最大相对误差 0.048%——已贴近同段数下 minimax 下界 0.047%。
-- **端到端 FlashAttention**：以 fp64 标准 softmax 为 golden，MAE 1.17×10⁻³、MRE 0.0985%。
-- **GEMV**：以 bit-exact 为目标，绝大多数输出与 fp64 参考完全一致，约 0.05% 出现 ULP 级偏差
-  （FP32 并行累加顺序与串行参考不同所致）。
-- **生成质量**：硬件版与纯 CPU 版在 256-token 序列上 greedy 解码**逐 token 一致**，
-  next-token logit 差异仅 10⁻³ 量级，不改变 argmax。
-
-## 存储带宽扩展：SoC 总线加宽至 64 位
-
-两类算子卸载到加速器之后，标量 CPU 的算力约束被解除，两者本身访存密集的性质就浮上来
-成为唯一的瓶颈：分段计时显示
-`GEMV.hw` 占端到端时间的 33.23%，而其中按总线位宽算出的纯搬运下界又占了这一段的 87.42%；
-FSA 单 tile 实测 524 拍，对比 32 位总线下的传输下界 512 拍只差 2.3%。也就是说阵列几乎
-没有在等计算——继续加 PE 不会有收益，靠计算/搬运重叠隐藏延迟也已接近极限（跨调用预取实测
-只拿到约 1%）。
-
-硬件侧恰好留有余量：开发板上两片各 32 位的异步 SRAM，原本由 `addr[22]` 二选一，同一拍
-总有一片的数据引脚闲置。改为两片共用低位地址、同时驱动、高低半字各出 32 位拼成 64 位后，
-单次访问取回的字节数翻倍，而异步 SRAM 的 $t_{AA}$ 是器件物理属性、与一次取几个字节无关，
-访问时序不变。
-
-主要改动（均在本仓库内）：
-
-- **互连替换**：原 SpinalHDL 生成的 2×8 crossbar 位宽在生成时写死、且仓库内无源描述，
-  改用 pulp-platform 的 `axi_xbar`（位宽/端口数/ID 位宽全是参数），见
-  [axi_xbar_2x8_wrap.sv](soc/rtl/ip/Bus_interconnects/axi_xbar_2x8_wrap.sv)。顺带把 DMA
-  提升为正规 master（旧结构下它只能到达 4 个从设备），端口收敛为 2×5。
-- **CPU 侧升宽**：`core_top` 数据总线写死 32 位且无参数，在其 AXI 口后插一级
-  `axi_dw_converter` 做 32→64。它做的是*打包*而非填充，CPU 一次 16 字节 cache 行填充
-  由 4 拍 32 位变成 2 拍 64 位，访存次数减半——加宽的收益不只归加速器。
-- **外设直接加宽**而非降回 32 位：9 个降宽器每个约 2700 LUT，实测把整机占用推到约 97%
-  已无法布通；且升宽器改写 `size` 后再降宽会把一次访问拆成两次，对 UART 接收 FIFO
-  这类读敏感寄存器就是丢数据。四个外设改为 64 位前端、按 `wstrb` 选半字。
-- **片上配合**：Input SRAM 改双字 entry（32 深 × 64 位）承接占 DMA 流量约 99% 的权重/KV
-  主通路；Vector SRAM 把 bank 选择由地址高位改低位使相邻两字可并行写入；主存镜像按字
-  交织成两份（`soc/sdk/axi_ram_base.mif` / `axi_ram_ext.mif`）。
-- **返回通路 skid 寄存器**：RAM 侧 64 位而 CPU 侧 32 位，读返回需一拍拆两拍、出口速率减半，
-  突发中必然背压，故在 [axi2sram_sp_ext.sv](soc/rtl/ip/Bus_interconnects/axi2sram_sp_ext.sv)
-  数据通路上补一级 skid，当前拍与在途拍分开保存。
-
-代价与收益：
-
-| 指标 | 加宽前 | 加宽后 | 变化 |
-|------|-------:|-------:|------|
-| cycles/token | 589,090 | 508,319 | **−13.7%** |
-| `GEMV.hw` | 195,773（33.23%） | 115,351（22.69%） | −41.1% |
-| LUT 占用 | 107,301（79.72%） | 110,770（82.30%） | +3,639 LUT |
-
-`GEMV.hw` 下降 41.1%，与"搬运时间减半"同一量级，差额来自地址通道开销与奇数列宽下的
-非对齐代价。时序上四组报告零违例，setup 余量由 +0.767 ns 降至 +0.566 ns，是加宽应付的
-代价。
-
-## 验证状态
-
-UVM 1.2 + 约束随机 + 覆盖率驱动，仿真工具 Synopsys VCS。顶层以加速器为黑盒经 AXI 驱动、
-用 DPI-C 黄金模型逐输出比对；单元级对 PE、exp2、CMP、accumulator 做 ULP 级比对。
-
-| 类别 | 结果 |
-|------|------|
-| UVM 测试点 | 约 590 个，功能类全 PASS（18 个 test，覆盖 directed/random/stress/错误注入/中途复位/容量边界六类） |
-| 代码覆盖率 | Line 91.08% / Condition 86.57% / Toggle 95.35% / FSM 90.10% / Branch 86.18%（16 test 合并，原始值） |
-| 功能覆盖率 | 95.19% |
-| Directed TB | FSA E2E 三种分组模式各跑一轮（含 GQA 用例与 bit-accurate golden 对照）、GEMV tiling 定向回归 |
-
-FSM 覆盖率距 95% 目标差约 4.9%，未覆盖的是 1~2 拍极短状态到 `S_IDLE` 的复位转移对，属结构性
-不可测转移，已列入 waiver（详见 [覆盖率 waiver](uvm/docs/coverage_waivers.md)）。
-
-## 综合成果
-
-- **逻辑综合（DC）**：Nangate45 开源工艺库（typical，1.1 V），时钟约束 5.0 ns（200 MHz），
-  OS/FSA 两种模式均时序收敛，关键路径 4.86 ns、Setup WNS/TNS 均为 0。
-- **FPGA 布线后资源**（`xc7a200t`）：Slice LUTs 94,037（70.28%）、Slice Registers 49,535
-  （18.51%）、DSP48E1 85 个（11.49%）、RAMB18E1 118 个（16.16%）。DSP 占用低印证了
-  一维阵列换取可控资源占用的设计权衡。
-- **FPGA 时序**：`sys_clk`（50 MHz）布线后 WNS ≈ +0.50 ns、TNS = 0。
-
-![FPGA 布线后资源利用率](docs/figures/fpga_resource.png)
-
-> **图 5** FPGA 布线后资源利用率（outstanding-4 阶段快照）：主要消耗在 LUT，DSP 仅 11.5%。
-
-> 说明：ASIC 后端物理实现（P&R、签核）不在本仓库开源范围内。
+> 更完整的架构论证、精度实验与综合数据见 [`docs/spec/`](docs/spec/) 与
+> [`uvm/docs/`](uvm/docs/)；ASIC 后端物理实现不在本仓库开源范围内。
 
 ## 目录结构
 
@@ -237,7 +143,7 @@ gemv_fsa/
 
 > `docs/summary/` 下的两份评估报告是**早期版本的记录**：写于 exp2 换用 Chebyshev 系数、
 > CPU 侧补 FPU、64 位总线等优化之前，其中的加速比（15.9×）与 exp2 精度（0.0626%）均已被
-> 上文表格中的最新数据取代，保留仅作迭代过程参考。
+> 上文的最新数据取代，保留仅作迭代过程参考。
 
 ## 快速开始
 
@@ -270,17 +176,10 @@ make -f Makefile.vcs run_uvm UVM_TEST=gemv_sanity_test
 make -f Makefile.vcs run_uvm_cov UVM_TEST=fsa_soak_test
 ```
 
-日常回归（11 test）：`csr_access_test` `gemv_sanity_test` `gemv_regression_test`
-`silu_sanity_test` `silu_bypass_test` `pf_sanity_test` `pf_bypass_test` `fsa_sanity_test`
-`fsa_regression_test` `fsa_gqa_test` `dual_mode_stress_test`
-
-全量回归在上述基础上追加：`gemv_random_test` `gemv_random_bigrow_test`
-`silu_regression_test` `silu_random_test` `pf_regression_test` `pf_random_test`
-`fsa_random_test` `fsa_gqa_random_test` `error_injection_test` `mid_op_reset_test`
-`precise_fsm_reset_test` `special_fp_test` `fsa_residue_impact_test` `fsa_soak_test`
-`fsa_hd64_test` `fsa_hd48_test` `perf_limit_test`
-
-逐个跑 `make -f Makefile.vcs run_uvm UVM_TEST=<name>` 即可。
+日常回归 11 个 test（`csr_access` / `gemv_sanity` / `gemv_regression` / `silu_sanity` /
+`silu_bypass` / `pf_sanity` / `pf_bypass` / `fsa_sanity` / `fsa_regression` / `fsa_gqa` /
+`dual_mode_stress`），全量回归共 28 个——完整清单与各自的测试点数见
+[UVM 验证报告](uvm/docs/verification_report.md)。
 
 ### SoC / 板上 demo
 

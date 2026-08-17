@@ -26,19 +26,37 @@
 意义，故映射为**输出驻留（OS）**数据流：部分和在 PE 内原位累加，权重与输入向量流过阵列，
 正好契合"输入向量小、权重体量大、层间切换频繁"的访存特征。
 
+<p align="center">
+  <img src="docs/figures/gemv_os_dataflow.png" width="330" alt="GEMV 的 Output-Stationary 脉动数据流">
+</p>
+<p align="center"><sub>GEMV 的 OS 脉动数据流：部分和驻留在 PE 内原位累加，输入数据沿阵列流动并被各级 PE 复用</sub></p>
+
 **注意力**（当前 token 的 Q 与 KV cache 中的历史 K/V 做 $QK^\top$ → softmax → $PV$）：
 每步同样只有一行 Q，却要把整个 KV cache 读一遍才做很少的乘加；且 softmax 的逐行全局归约
 使中间结果的访存量随序列长度呈 $O(N^2)$ 增长，极易超过片上存储。这一路的设计分两步走。
-**先在算法层**选定 **FlashAttention-2 的在线 softmax**：沿序列维把 K/V 分块，逐块更新行
+**先在算法层**引入 **FlashAttention-2 的在线 softmax**：沿序列维把 K/V 分块，逐块更新行
 最大值 $m$ 与归一化分母 $l$、并对已累加的输出 $O$ 做 rescale，全程不显式存储完整的注意力
 矩阵，把访存复杂度降至 $O(N)$。**再由该算法的流式特性推导硬件数据流**：分数随计算逐行
 流出、随即做最大值比较与指数变换，无需等整个矩阵就绪，但这要求一条"流出—变换—流回"的
-通路——OS 把部分和封锁在 PE 内、末端才一次性 drain，中途取不到中间结果，只有**权重驻留
-（WS）**天然支持。故注意力取 WS：Q 驻留在 PE 寄存器，K/V 沿阵列流入，$QK^\top$ 的累加、
+通路——OS 把部分和封锁在 PE 内、末端才一次性 drain，中途取不到中间结果，只有 **权重驻留
+（WS）** 天然支持。故注意力取 WS：Q 驻留在 PE 寄存器，K/V 沿阵列流入，$QK^\top$ 的累加、
 softmax 的传播与 rescale、$PV$ 的累加在同一条脉动链上流水完成。
 
+<p align="center">
+  <img src="docs/figures/fsa_dataflow.png" width="880" alt="FSA 在脉动链上的四阶段数据流">
+</p>
+<p align="center"><sub>FSA 数据流的四个阶段：① K 流入、Q 驻留算 $QK^\top$ 上行累加 → ② CMP 求行最大值 $M_0$ →
+③ 减最大值后经 slope/intercept 查表做 exp2 分段线性近似得到 $P$ → ④ $P$ 与 V 相乘下行累加出 $O$</sub></p>
+
 两类算子若各做一套阵列，在资源受限的边缘 FPGA 上并不划算，因此本设计让同一套 32-PE 阵列
-通过可重构分组与上述双模式数据流同时覆盖二者。
+通过可重构分组与上述双模式数据流同时覆盖二者——32 可被 8/16/32 整除，因此能无浪费地重构为
+三种分组，覆盖 `head_dim` 从 8 到 64 的不同配置。
+
+<p align="center">
+  <img src="docs/figures/reconfig_grouping.png" width="620" alt="32-PE 阵列的三种可重构分组">
+</p>
+<p align="center"><sub>可重构分组：4×8（4 头并行，每头 8 PE）/ 2×16 / 1×32。分组变大时由多段 PE 串联成更长的脉动链，
+灰色 CMP 表示该段的比较单元在本模式下不使能</sub></p>
 
 但只做加速器还不够。竞赛平台龙芯 OpenLA500 是**单核标量、且无硬件浮点单元**的嵌入式处理器（LoongArch32，
 33 MHz）：乘加只能串行执行，非线性算子（RMSNorm、RoPE、SiLU）全靠软浮点模拟，单 token 解码
@@ -52,7 +70,15 @@ softmax 的传播与 rescale、$PV$ 的累加在同一条脉动链上流水完�
    一倍（详见下文）。
 
 三者经 AXI 互联组成完整的推理加速 SoC，在 FPGA 上跑通 llama2.c + stories260K 的端到端
-自回归推理。
+自回归推理。加速器顶层由 AXI 从接口与 CSR 寄存器组、AXI 主接口与 DMA 控制器、计算核心
+（32 个 PE、CMP 比较单元、累加器与片上 SRAM）以及顶层作业控制器四部分组成：
+
+<p align="center">
+  <img src="docs/figures/top_architecture.png" width="820" alt="加速器顶层架构">
+</p>
+<p align="center"><sub>加速器顶层架构：CSR/DMA 调度 + 32-PE 脉动阵列 + Input/Vector/ACC/Output 四级片上 SRAM。
+CPU 通过 CSR 配置一次 job 并启动，顶层状态机驱动 DMA 搬数、触发阵列计算、再把结果写回内存，
+全程 CPU 不介入数据搬运</sub></p>
 
 | 项目 | 内容 |
 |------|------|
@@ -155,6 +181,11 @@ FSM 覆盖率距 95% 目标差约 4.9%，未覆盖的是 1~2 拍极短状态到 
   一维阵列换取可控资源占用的设计权衡。
 - **FPGA 时序**：`sys_clk`（50 MHz）布线后 WNS ≈ +0.50 ns、TNS = 0。
 
+<p align="center">
+  <img src="docs/figures/fpga_resource.png" width="620" alt="FPGA 布线后资源利用率">
+</p>
+<p align="center"><sub>FPGA 布线后资源利用率（outstanding-4 阶段快照）：主要消耗在 LUT，DSP 仅 11.5%</sub></p>
+
 > 说明：ASIC 后端物理实现（P&R、签核）不在本仓库开源范围内。
 
 ## 目录结构
@@ -199,6 +230,7 @@ gemv_fsa/
 ├── tools/                       # TB 用到的 C 侧 golden/eval 小工具
 ├── scripts/                     # filelist、Vivado 综合/bitgen tcl、工具链构建脚本
 ├── docs/spec/                   # 设计规格（FSA 编程手册、各模块设计 plan）
+├── docs/figures/                # README 用架构图
 ├── docs/summary/                # 早期评估记录（见下方说明）
 ├── LICENSE                      # Apache-2.0
 ├── Makefile.vcs                 # VCS 本地编译/运行入口

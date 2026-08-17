@@ -26,10 +26,9 @@
 意义，故映射为**输出驻留（OS）**数据流：部分和在 PE 内原位累加，权重与输入向量流过阵列，
 正好契合"输入向量小、权重体量大、层间切换频繁"的访存特征。
 
-<p align="center">
-  <img src="docs/figures/gemv_os_dataflow.png" width="330" alt="GEMV 的 Output-Stationary 脉动数据流">
-</p>
-<p align="center"><sub>GEMV 的 OS 脉动数据流：部分和驻留在 PE 内原位累加，输入数据沿阵列流动并被各级 PE 复用</sub></p>
+![GEMV 的 Output-Stationary 脉动数据流](docs/figures/gemv_os_dataflow.png)
+
+> **图 1** GEMV 的 OS 脉动数据流：部分和驻留在 PE 内原位累加，输入数据沿阵列流动并被各级 PE 复用。
 
 **注意力**（当前 token 的 Q 与 KV cache 中的历史 K/V 做 $QK^\top$ → softmax → $PV$）：
 每步同样只有一行 Q，却要把整个 KV cache 读一遍才做很少的乘加；且 softmax 的逐行全局归约
@@ -42,21 +41,19 @@
 （WS）** 天然支持。故注意力取 WS：Q 驻留在 PE 寄存器，K/V 沿阵列流入，$QK^\top$ 的累加、
 softmax 的传播与 rescale、$PV$ 的累加在同一条脉动链上流水完成。
 
-<p align="center">
-  <img src="docs/figures/fsa_dataflow.png" width="880" alt="FSA 在脉动链上的四阶段数据流">
-</p>
-<p align="center"><sub>FSA 数据流的四个阶段：① K 流入、Q 驻留算 $QK^\top$ 上行累加 → ② CMP 求行最大值 $M_0$ →
-③ 减最大值后经 slope/intercept 查表做 exp2 分段线性近似得到 $P$ → ④ $P$ 与 V 相乘下行累加出 $O$</sub></p>
+![FSA 在脉动链上的四阶段数据流](docs/figures/fsa_dataflow.png)
+
+> **图 2** FSA 数据流的四个阶段：① K 流入、Q 驻留算 QKᵀ 上行累加 → ② CMP 求行最大值 M₀ →
+> ③ 减最大值后经 slope/intercept 查表做 exp2 分段线性近似得到 P → ④ P 与 V 相乘下行累加出 O。
 
 两类算子若各做一套阵列，在资源受限的边缘 FPGA 上并不划算，因此本设计让同一套 32-PE 阵列
 通过可重构分组与上述双模式数据流同时覆盖二者——32 可被 8/16/32 整除，因此能无浪费地重构为
 三种分组，覆盖 `head_dim` 从 8 到 64 的不同配置。
 
-<p align="center">
-  <img src="docs/figures/reconfig_grouping.png" width="620" alt="32-PE 阵列的三种可重构分组">
-</p>
-<p align="center"><sub>可重构分组：4×8（4 头并行，每头 8 PE）/ 2×16 / 1×32。分组变大时由多段 PE 串联成更长的脉动链，
-灰色 CMP 表示该段的比较单元在本模式下不使能</sub></p>
+![32-PE 阵列的三种可重构分组](docs/figures/reconfig_grouping.png)
+
+> **图 3** 可重构分组：4×8（4 头并行，每头 8 PE）/ 2×16 / 1×32。分组变大时由多段 PE 串联成更长的
+> 脉动链，灰色 CMP 表示该段的比较单元在本模式下不使能。
 
 但只做加速器还不够。竞赛平台龙芯 OpenLA500 是**单核标量、且无硬件浮点单元**的嵌入式处理器（LoongArch32，
 33 MHz）：乘加只能串行执行，非线性算子（RMSNorm、RoPE、SiLU）全靠软浮点模拟，单 token 解码
@@ -73,12 +70,11 @@ softmax 的传播与 rescale、$PV$ 的累加在同一条脉动链上流水完�
 自回归推理。加速器顶层由 AXI 从接口与 CSR 寄存器组、AXI 主接口与 DMA 控制器、计算核心
 （32 个 PE、CMP 比较单元、累加器与片上 SRAM）以及顶层作业控制器四部分组成：
 
-<p align="center">
-  <img src="docs/figures/top_architecture.png" width="820" alt="加速器顶层架构">
-</p>
-<p align="center"><sub>加速器顶层架构：CSR/DMA 调度 + 32-PE 脉动阵列 + Input/Vector/ACC/Output 四级片上 SRAM。
-CPU 通过 CSR 配置一次 job 并启动，顶层状态机驱动 DMA 搬数、触发阵列计算、再把结果写回内存，
-全程 CPU 不介入数据搬运</sub></p>
+![加速器顶层架构](docs/figures/top_architecture.png)
+
+> **图 4** 加速器顶层架构：CSR/DMA 调度 + 32-PE 脉动阵列 + Input/Vector/ACC/Output 四级片上 SRAM。
+> CPU 通过 CSR 配置一次 job 并启动，顶层状态机驱动 DMA 搬数、触发阵列计算、再把结果写回内存，
+> 全程 CPU 不介入数据搬运。
 
 | 项目 | 内容 |
 |------|------|
@@ -181,10 +177,9 @@ FSM 覆盖率距 95% 目标差约 4.9%，未覆盖的是 1~2 拍极短状态到 
   一维阵列换取可控资源占用的设计权衡。
 - **FPGA 时序**：`sys_clk`（50 MHz）布线后 WNS ≈ +0.50 ns、TNS = 0。
 
-<p align="center">
-  <img src="docs/figures/fpga_resource.png" width="620" alt="FPGA 布线后资源利用率">
-</p>
-<p align="center"><sub>FPGA 布线后资源利用率（outstanding-4 阶段快照）：主要消耗在 LUT，DSP 仅 11.5%</sub></p>
+![FPGA 布线后资源利用率](docs/figures/fpga_resource.png)
+
+> **图 5** FPGA 布线后资源利用率（outstanding-4 阶段快照）：主要消耗在 LUT，DSP 仅 11.5%。
 
 > 说明：ASIC 后端物理实现（P&R、签核）不在本仓库开源范围内。
 

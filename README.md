@@ -196,10 +196,47 @@ make -f Makefile.vcs run_uvm_cov UVM_TEST=fsa_soak_test
 
 ## 参考
 
-- Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
-- Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
-- Lin et al., *SystolicAttention: Fusing FlashAttention within a Single Systolic Array*, arXiv preprint, 2025. [arXiv:2507.11331](https://arxiv.org/abs/2507.11331)
+- Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré.
+  *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*.
+  NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
+- Tri Dao.
+  *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*.
+  ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
+- Jiawei Lin, Yuanlong Li, Guokai Chen, Thomas Bourgeat.
+  *SystolicAttention: Fusing FlashAttention within a Single Systolic Array*.
+  arXiv preprint, 2025. [arXiv:2507.11331](https://arxiv.org/abs/2507.11331)
   （FSA 模式的脉动阵列映射思路参考自该工作；GEMV 模式的 OS 数据流为本项目独立设计）
+
+<details>
+<summary>BibTeX（作者/arXiv 官方条目）</summary>
+
+```bibtex
+@inproceedings{dao2022flashattention,
+  title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
+  author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2022}
+}
+
+@inproceedings{dao2023flashattention2,
+  title={Flash{A}ttention-2: Faster Attention with Better Parallelism and Work Partitioning},
+  author={Dao, Tri},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
+}
+
+@misc{lin2025systolicattentionfusingflashattentionsingle,
+  title={SystolicAttention: Fusing FlashAttention within a Single Systolic Array},
+  author={Jiawei Lin and Yuanlong Li and Guokai Chen and Thomas Bourgeat},
+  year={2025},
+  eprint={2507.11331},
+  archivePrefix={arXiv},
+  primaryClass={cs.AR},
+  url={https://arxiv.org/abs/2507.11331}
+}
+```
+
+</details>
 
 ## 许可证
 

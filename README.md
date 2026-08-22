@@ -4,16 +4,17 @@
 线性层 GEMV，用权重驻留（WS）+ FlashAttention-2 在线 softmax 加速注意力。配合 CPU 侧浮点
 扩展与 64 位总线，在无硬件浮点的国产标量处理器上跑通 llama2.c 端到端推理。
 
-本仓库是 **2026 年全国大学生集成电路创新创业大赛（集创赛）龙芯中科杯总决赛**参赛作品
+本仓库是 **2026 年第十届全国大学生集成电路创新创业大赛（集创赛）龙芯中科杯总决赛**参赛作品
 《支持 FlashAttention 的推理加速 SoC 设计》的前端设计部分开源发布。
 
-| | |
+| 项目 | 内容 |
 |---|---|
-| 赛事 | 2026 年全国大学生集成电路创新创业大赛（集创赛） |
+| 赛事 | 2026 年第十届全国大学生集成电路创新创业大赛（集创赛） |
 | 赛题 | 龙芯中科杯 |
 | 阶段 | 总决赛 |
 | 队伍编号 | **CICC1001054** |
 | 作品名称 | 支持 FlashAttention 的推理加速 SoC 设计 |
+| 奖项 | **华东赛区一等奖**、**全国二等奖** |
 
 ![系统总览](docs/figures/system_overview.png)
 
@@ -41,7 +42,7 @@
 自回归解码阶段每层内有两类算子，都是访存密集：线性层因每步只有单个 token 向量而退化为 **GEMV**，
 注意力则要读完整 KV cache 且 softmax 归约使访存随序列长度呈 $O(N^2)$ 增长。二者数据复用方式相反，
 故分别选型：GEMV 权重算完即弃 → **输出驻留（OS）**；注意力先在算法层引入
-**FlashAttention-2 在线 softmax** 把访存降至 $O(N)$，再由其流式特性推出需要"流出—变换—流回"通路
+**FlashAttention-2 在线 softmax** 把访存降至 $O(N)$，再由其流式特性推出需要“流出—变换—流回”通路
 → **权重驻留（WS）**。两者共用同一套 32-PE 阵列，省去为两类算子各做一套的开销。
 
 ![FSA 在脉动链上的四阶段数据流](docs/figures/fsa_dataflow.png)
@@ -93,48 +94,48 @@ ID 级增加 FP 解码与浮点寄存器堆（3R2W / FCC）、EX 级挂 CVFPU �
 
 ```
 gemv_fsa/
-├── rtl/                        # 加速器 RTL 源代码
-│   ├── CB_top_v2.sv            # 顶层模块
-│   ├── cb_controll_v2.sv       # 控制器（CSR + GEMV/FSA 双模式 DMA 调度 + 预取 FSM）
-│   ├── mac_top_v2.sv           # MAC 引擎顶层（PE 阵列 + FSA 数据通路）
-│   ├── PE_core_v2.sv           # 32-PE 阵列（OS/WS 双模式）
-│   ├── axi_dma_controller.sv   # AXI4 DMA 控制器（多笔 outstanding）
-│   ├── PE/                     # PE 单元（Chisel 生成后手工重定时）
-│   ├── fsa/                    # FlashAttention 专用模块
-│   │   ├── fsa_ctrl_fsm.sv     # FSA 控制 FSM
-│   │   ├── fsa_transposer.sv   # K 矩阵转置引擎
-│   │   ├── fsa_accumulator.sv  # 在线 softmax 累加器
-│   │   ├── FPAccUnit_pipe.sv   # 含 exp2 8 段 PWL（Chebyshev 系数）
-│   │   └── silu_ctrl_fsm.sv    # SiLU 激活融合控制
-│   └── fsa_gen/chisel_fsa_fp32/ # Chisel 生成的 FP 运算单元（CMP/比较器等）
+├── rtl/                          # 加速器 RTL 源代码
+│   ├── CB_top_v2.sv              # 顶层模块
+│   ├── cb_controll_v2.sv         # 控制器（CSR + GEMV/FSA 双模式 DMA 调度 + 预取 FSM）
+│   ├── mac_top_v2.sv             # MAC 引擎顶层（PE 阵列 + FSA 数据通路）
+│   ├── PE_core_v2.sv             # 32-PE 阵列（OS/WS 双模式）
+│   ├── axi_dma_controller.sv     # AXI4 DMA 控制器（多笔 outstanding）
+│   ├── PE/                       # PE 单元（Chisel 生成后手工重定时）
+│   ├── fsa/                      # FlashAttention 专用模块
+│   │   ├── fsa_ctrl_fsm.sv       # FSA 控制 FSM
+│   │   ├── fsa_transposer.sv     # K 矩阵转置引擎
+│   │   ├── fsa_accumulator.sv    # 在线 softmax 累加器
+│   │   ├── FPAccUnit_pipe.sv     # 含 exp2 8 段 PWL（Chebyshev 系数）
+│   │   └── silu_ctrl_fsm.sv      # SiLU 激活融合控制
+│   └── fsa_gen/chisel_fsa_fp32/  # Chisel 生成的 FP 运算单元（CMP/比较器等）
 │
-├── tb/                          # Directed Testbench
-│   ├── tb_fsa_e2e.sv            # FSA 端到端验证（含 GQA、bit-accurate golden）
-│   ├── tb_CB_top_v2_gemv.sv     # GEMV tiling 回归
-│   ├── dpi/                     # DPI-C 黄金模型（fp64 softmax + bit-accurate 转录）
-│   ├── golden/                  # Python 侧 golden 生成
-│   └── board_data/              # 板上抓取数据（用于回归对比）
+├── tb/                           # Directed Testbench
+│   ├── tb_fsa_e2e.sv             # FSA 端到端验证（含 GQA、bit-accurate golden）
+│   ├── tb_CB_top_v2_gemv.sv      # GEMV tiling 回归
+│   ├── dpi/                      # DPI-C 黄金模型（fp64 softmax + bit-accurate 转录）
+│   ├── golden/                   # Python 侧 golden 生成
+│   └── board_data/               # 板上抓取数据（用于回归对比）
 │
-├── uvm/                         # UVM 1.2 验证环境
-│   ├── docs/                    # 验证报告、验证计划、环境架构、覆盖率 waiver
-│   ├── agents/                  # AXI Slave Agent / DDR backdoor mem_model
-│   ├── ral/                     # UVM RAL 寄存器模型
+├── uvm/                          # UVM 1.2 验证环境
+│   ├── docs/                     # 验证报告、验证计划、环境架构、覆盖率 waiver
+│   ├── agents/                   # AXI Slave Agent / DDR backdoor mem_model
+│   ├── ral/                      # UVM RAL 寄存器模型
 │   └── env/ sequences/ tests/ interfaces/ dpi/ top/
 │
-├── soc/                         # SoC 集成（集创赛龙芯杯平台）
-│   ├── rtl/ip/open-la500/       # 龙芯 OpenLA500 CPU（含 cvfpu 浮点扩展，Mulan PSL v2）
-│   ├── rtl/ip/gemv_accel/       # 加速器 RTL 的同步副本（见下方说明，非独立实现）
+├── soc/                          # SoC 集成（集创赛龙芯杯平台）
+│   ├── rtl/ip/open-la500/        # 龙芯 OpenLA500 CPU（含 cvfpu 浮点扩展，Mulan PSL v2）
+│   ├── rtl/ip/gemv_accel/        # 加速器 RTL 的同步副本（见下方说明，非独立实现）
 │   ├── rtl/ip/Bus_interconnects/ # AXI 互联（64 位 crossbar wrapper + SRAM 桥）
-│   └── sdk/software/apps/       # llama2.c 推理固件（runc 系列）+ bsp
+│   └── sdk/software/apps/        # llama2.c 推理固件（runc 系列）+ bsp
 │
-├── third_party/                 # vendored 第三方开源 RTL（pulp-platform axi / common_verification）
-├── tools/                       # TB 用到的 C 侧 golden/eval 小工具
-├── scripts/                     # filelist、Vivado 综合/bitgen tcl、工具链构建脚本
-├── docs/spec/                   # 设计规格（FSA 编程手册、各模块设计 plan）
-├── docs/figures/                # README 用架构图
-├── docs/summary/                # 早期评估记录（见下方说明）
-├── LICENSE                      # Apache-2.0
-├── Makefile.vcs                 # VCS 本地编译/运行入口
+├── third_party/                  # vendored 第三方开源 RTL（pulp-platform axi / common_verification）
+├── tools/                        # TB 用到的 C 侧 golden/eval 小工具
+├── scripts/                      # filelist、Vivado 综合/bitgen tcl、工具链构建脚本
+├── docs/spec/                    # 设计规格（FSA 编程手册、各模块设计 plan）
+├── docs/figures/                 # README 用架构图
+├── docs/summary/                 # 早期评估记录（见下方说明）
+├── LICENSE                       # Apache-2.0
+├── Makefile.vcs                  # VCS 本地编译/运行入口
 └── README.md
 ```
 

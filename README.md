@@ -196,9 +196,9 @@ make -f Makefile.vcs run_uvm_cov UVM_TEST=fsa_soak_test
 
 ## 参考
 
-- Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022.
-- Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, 2023.
-- Lin et al., *SystolicAttention: Fusing FlashAttention within a Single Systolic Array*, 2025.
+- Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
+- Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
+- Lin et al., *SystolicAttention: Fusing FlashAttention within a Single Systolic Array*, arXiv preprint, 2025. [arXiv:2507.11331](https://arxiv.org/abs/2507.11331)
   （FSA 模式的脉动阵列映射思路参考自该工作；GEMV 模式的 OS 数据流为本项目独立设计）
 
 ## 许可证
